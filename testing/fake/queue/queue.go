@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
@@ -34,6 +35,9 @@ import (
 // FixedQeueue or UpdateQueue.
 type Queue interface {
 	Next() (interface{}, error)
+	Wait()
+	Signal()
+	Add(interface{})
 }
 
 // UpdateQueue is a structure that orders a set of device updates by their
@@ -46,6 +50,7 @@ type UpdateQueue struct {
 	latest   int64
 	q        [][]*value
 	r        *rand.Rand
+	event    chan string
 }
 
 // New creates a new UpdateQueue. If delay is true, a call to Next()
@@ -60,19 +65,60 @@ func New(delay bool, seed int64, values []*fpb.Value) *UpdateQueue {
 	for _, v := range values {
 		u.addValue(newValue(v, u.r))
 	}
+
+	u.event = make(chan string, 1)
+	/*
+		ticker := time.NewTicker(time.Millisecond * 2000)
+		go func() {
+			for t := range ticker.C {
+				fmt.Println("Tick at", t)
+				//path := [...]string{"VLANTABLE", "|", "VLAN1000"}
+				path := []string{"VLANTABLE", "VLAN1000"}
+				fpbv := &fpb.Value{
+					Path:      path,
+					Timestamp: &fpb.Timestamp{Timestamp: time.Now().UnixNano()},
+					Repeat:    1,
+					Seed:      0,
+					Value:     &fpb.Value_StringValue{&fpb.StringValue{Value: "foo", Distribution: nil}}}
+				u.Add(fpbv)
+				fmt.Println("Added fpbv #%v", fpbv)
+			}
+		}()
+	*/
 	return u
 }
 
 // Add inserts v into the queue in correct timestamp order.
-func (u *UpdateQueue) Add(v *fpb.Value) {
+func (u *UpdateQueue) Add(val interface{}) {
+	log.V(6).Infof("Add enter: queue len is %v", len(u.q))
 	u.mu.Lock()
 	defer u.mu.Unlock()
+
+	// Type assertion, panic if not match
+	v := val.(*fpb.Value)
 	u.addValue(newValue(v, u.r))
+	//signal consumer if this is only element
+	if len(u.q) == 1 {
+		u.Signal()
+	}
+	log.V(6).Infof("Add done: queue len is %v", len(u.q))
 }
 
 // Latest returns the maximum timestamp in the queue.
 func (u *UpdateQueue) Latest() int64 {
 	return u.latest
+}
+
+// Hold until being notified.
+func (u *UpdateQueue) Wait() {
+	msg := <-u.event
+	log.V(6).Infof("Received %v", msg)
+}
+
+func (u *UpdateQueue) Signal() {
+	// Notify consumer if updateQueue was empty
+	u.event <- "ping"
+	log.V(6).Infof("Done Sending ping to channel u.event")
 }
 
 // Next returns the next update in the queue or an error.  If the queue is
@@ -105,10 +151,12 @@ func (u *UpdateQueue) Next() (interface{}, error) {
 	} else {
 		u.q[0] = u.q[0][1:]
 	}
-	// Add the updated value to the queue if the repeats are not exhausted.
-	if v.v != nil {
-		u.addValue(v)
-	}
+	/*
+		// Add the updated value to the queue if the repeats are not exhausted.
+		if v.v != nil {
+			u.addValue(v)
+		}
+	*/
 	// Set up a delay for the next retrieval if realtime delays are requested.
 	if u.delay && checkDelay && len(u.q) > 0 {
 		u.duration = time.Duration(u.q[0][0].v.Timestamp.Timestamp-val.Timestamp.Timestamp) * time.Nanosecond

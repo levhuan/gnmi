@@ -27,10 +27,27 @@ func NewFixed(resp []*gpb.SubscribeResponse, delay bool) *FixedQueue {
 }
 
 // Add will append resp to the current tail of the queue.
+/*
 func (q *FixedQueue) Add(resp *gpb.SubscribeResponse) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.resp = append(q.resp, resp)
+}
+*/
+
+func (q *FixedQueue) Add(r interface{}) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	resp := r.(*gpb.SubscribeResponse)
+	q.resp = append(q.resp, resp)
+}
+
+// Hold until being notified.
+func (u *FixedQueue) Wait() {
+}
+
+func (u *FixedQueue) Signal() {
+	// Notify consumer if updateQueue was empty
 }
 
 // Next returns the next update in the queue or an error. If the queue is

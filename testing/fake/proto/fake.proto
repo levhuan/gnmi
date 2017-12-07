@@ -8,6 +8,7 @@ import "github.com/openconfig/gnmi/proto/gnmi/gnmi.proto";
 
 package gnmi.fake;
 
+/*
 service AgentManager {
   // Add adds an agent to the server.
   rpc Add(Config) returns (Config);
@@ -16,7 +17,7 @@ service AgentManager {
   // Get returns the current status of an agent on the server.
   rpc Get(Config) returns (Config);
 }
-
+*/
 enum State {
   STOPPED = 0;
   INIT = 1;

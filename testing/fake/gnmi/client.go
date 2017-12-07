@@ -17,6 +17,7 @@ limitations under the License.
 package gnmi
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"sync"
@@ -24,10 +25,11 @@ import (
 
 	log "github.com/golang/glog"
 	"github.com/kylelemons/godebug/pretty"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc"
 	"github.com/openconfig/gnmi/testing/fake/queue"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 
+	swsscommon "github.com/Azure/sonic-swss-common"
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
 	fpb "github.com/openconfig/gnmi/testing/fake/proto"
 )
@@ -44,6 +46,7 @@ type Client struct {
 	mu        sync.RWMutex
 	canceled  bool
 	q         queue.Queue
+	synced    bool
 	subscribe *gpb.SubscriptionList
 }
 
@@ -52,12 +55,184 @@ func NewClient(config *fpb.Config) *Client {
 	return &Client{
 		config: config,
 		polled: make(chan struct{}),
+		synced: false,
 	}
 }
 
 // String returns the target the client is querying.
 func (c *Client) String() string {
 	return c.config.Target
+}
+
+// Support fixed CONFIG_DB for now
+func subscribeDb(c *Client, stop chan struct{}) {
+	sublist := c.subscribe
+	var buffer bytes.Buffer
+	// _ = sublist
+
+	log.V(6).Infof("SubscribRequest : %#v", sublist)
+
+	var dbn int
+	var dbpath []string
+	var sstables []*swsscommon.SubscriberStateTable
+	// TODO: get db number from prefix or path
+	dbn = swsscommon.CONFIG_DB
+
+	// TODO: Prefix parsing parsing
+	prefix := sublist.GetPrefix()
+	log.V(6).Infof("prefix : %#v", prefix)
+
+	subscriptions := sublist.GetSubscription()
+	if subscriptions != nil {
+		for _, subscription := range subscriptions {
+			path := subscription.GetPath()
+			//log.V(2).Infof("path : %#v", path)
+			elements := path.GetElement()
+			if elements != nil {
+				// log.V(2).Infof("path.Element : %#v", elements)
+			}
+
+			buffer.Reset()
+			elems := path.GetElem()
+			if elems != nil {
+				//log.V(2).Infof("path.Elem : %#v", elems)
+				for i, elem := range elems {
+					log.V(6).Infof("index %d elem : %#v %#v", i, elem.GetName(), elem.GetKey())
+					if i != 0 {
+						buffer.WriteString("|")
+					}
+					buffer.WriteString(elem.GetName())
+				}
+				dbpath = append(dbpath, buffer.String())
+			}
+		}
+	}
+	log.V(6).Infof("dbpath : %#v", dbpath)
+
+	db := swsscommon.NewDBConnector(dbn, swsscommon.DBConnectorDEFAULT_UNIXSOCKET, uint(0))
+	defer swsscommon.DeleteDBConnector(db)
+
+	sel := swsscommon.NewSelect()
+	defer swsscommon.DeleteSelect(sel)
+
+	for _, table := range dbpath {
+		sstable := swsscommon.NewSubscriberStateTable(db, table)
+		defer swsscommon.DeleteSubscriberStateTable(sstable)
+		sel.AddSelectable(sstable.SwigGetSelectable())
+		sstables = append(sstables, &sstable)
+	}
+
+	for {
+		fd := []int{0}
+		var timeout uint = 1000
+
+		c.mu.RLock()
+		canceled := c.canceled
+		c.mu.RUnlock()
+		if canceled {
+			log.V(1).Infof("Client %s canceled, exiting subscribeDb routine", c)
+			return
+		}
+
+		var ret int
+		select {
+		default:
+			ret = sel.Xselect(fd, timeout)
+		case <-stop:
+			log.V(1).Infof("Stoping subscribeDb routine for Client %s ", c)
+			return
+		}
+
+		if ret == swsscommon.SelectTIMEOUT {
+			log.V(6).Infof("SelectTIMEOUT")
+			if c.synced == true {
+				continue
+			}
+			c.mu.RLock()
+			q := c.q
+			c.mu.RUnlock()
+			if q == nil {
+				log.V(1).Infof("Client %s has nil client queue nothing to do", c)
+				return
+			}
+			// Inject sync message after first timeout.
+			if !c.config.DisableSync {
+				q.Add(&fpb.Value{
+					Timestamp: &fpb.Timestamp{Timestamp: time.Now().UnixNano()},
+					Repeat:    1,
+					Value:     &fpb.Value_Sync{uint64(1)},
+				})
+			}
+			log.V(1).Infof("Client %s synced", c)
+			c.synced = true
+			continue
+		}
+		if ret != swsscommon.SelectOBJECT {
+			log.V(1).Infof("Error: Client %s Expecting : %v", c, swsscommon.SelectOBJECT)
+			continue
+		}
+
+		for _, sstable := range sstables {
+			if sel.IsSelected((*sstable).SwigGetSelectable()) {
+				vpsr := swsscommon.NewFieldValuePairs()
+				defer swsscommon.DeleteFieldValuePairs(vpsr)
+
+				ko := swsscommon.NewStringPair()
+				defer swsscommon.DeleteStringPair(ko)
+
+				(*sstable).Pop(ko, vpsr)
+				key := ko.GetFirst()
+				strlist := []string{}
+				strlist = append(strlist, ko.GetSecond())
+
+				for n := vpsr.Size() - 1; n >= 0; n-- {
+					strlist = append(strlist, "|")
+					fieldpair := vpsr.Get(int(n))
+					strlist = append(strlist, fieldpair.GetFirst(), "=", fieldpair.GetSecond())
+
+				}
+				log.V(6).Infof(" key %v, strlist %v", key, strlist)
+
+				c.mu.RLock()
+				q := c.q
+				c.mu.RUnlock()
+				if q == nil {
+					log.V(1).Infof("Client %s has nil client queue nothing to do", c)
+					return
+				}
+
+				path := []string{(*sstable).GetTableName()}
+				path = append(path, key)
+
+				buffer.Reset()
+				buffer.WriteString(ko.GetSecond())
+				for n := vpsr.Size() - 1; n >= 0; n-- {
+					fieldpair := vpsr.Get(int(n))
+					buffer.WriteString("|")
+					buffer.WriteString(fieldpair.GetFirst())
+					buffer.WriteString("=")
+					buffer.WriteString(fieldpair.GetSecond())
+				}
+
+				fpbv := &fpb.Value{
+					Path:      path,
+					Timestamp: &fpb.Timestamp{Timestamp: time.Now().UnixNano()},
+					Repeat:    1,
+					Seed:      0,
+					Value: &fpb.Value_StringValue{&fpb.StringValue{
+						Value: buffer.String(),
+						/*
+							Distribution: &fpb.StringValue_List{
+								List: &fpb.StringList{
+									Random:  false,
+									Options: strlist}}*/}},
+				}
+				log.V(6).Infof("configDB path %#v, strlist %#v", path, strlist)
+				q.Add(fpbv)
+				log.V(5).Infof("Added fpbv #%v", fpbv)
+			}
+		}
+	}
 }
 
 // Run starts the client. The first message received must be a
@@ -91,7 +266,8 @@ func (c *Client) Run(stream gpb.GNMI_SubscribeServer) (err error) {
 		}
 		return grpc.Errorf(grpc.Code(err), "received error from client")
 	}
-	log.V(1).Infof("Client %s recieved initial query: %v", c, query)
+
+	log.V(1).Infof("Client %s recieved initial query with go struct : %#v %v", c, query, query)
 
 	c.subscribe = query.GetSubscribe()
 	if c.subscribe == nil {
@@ -102,10 +278,27 @@ func (c *Client) Run(stream gpb.GNMI_SubscribeServer) (err error) {
 		return grpc.Errorf(codes.Aborted, "failed to initialize the queue: %v", err)
 	}
 
+	if c.subscribe.GetMode() == gpb.SubscriptionList_STREAM {
+		stoppedchan := make(chan struct{})
+		defer close(stoppedchan)
+		go subscribeDb(c, stoppedchan)
+	}
+
+	/*
+		if sublist.Mode == gpb.SubscriptionList_ONCE {
+			log.V(1).Infof("gpb.SubscriptionList_ONCE mode not supported : %#v", sublist)
+			return
+		}
+		if sublist.Mode == gpb.SubscriptionList_POLL {
+			log.V(1).Infof("gpb.SubscriptionList_POLL mode not supported : %#v", sublist)
+			return
+		}
+	*/
 	log.V(1).Infof("Client %s running", c)
 	go c.recv(stream)
 	c.send(stream)
 	log.V(1).Infof("Client %s shutdown", c)
+
 	return nil
 }
 
@@ -114,6 +307,10 @@ func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.canceled = true
+	if c.q != nil {
+		// inform queue consumer event happened
+		c.q.Signal()
+	}
 }
 
 // Config returns the current config of the client.
@@ -129,6 +326,7 @@ var syncResp = &gpb.SubscribeResponse{
 
 func (c *Client) recv(stream gpb.GNMI_SubscribeServer) {
 	for {
+		log.V(5).Infof("Client %s blocking on stream.Recv()", c)
 		event, err := stream.Recv()
 		c.recvMsg++
 		switch err {
@@ -157,6 +355,7 @@ func (c *Client) recv(stream gpb.GNMI_SubscribeServer) {
 		}
 		log.V(1).Infof("Client %s received invalid event: %s", c, event)
 	}
+	log.V(1).Infof("Client %s exit from recv()", c)
 }
 
 // processQueue makes a copy of q then will process values in the queue until
@@ -191,7 +390,12 @@ func (c *Client) processQueue(stream gpb.GNMI_SubscribeServer) error {
 			case c.config.DisableEof:
 				return fmt.Errorf("send exiting due to disabled EOF")
 			}
-			return fmt.Errorf("end of updates")
+			log.V(6).Infof("queue exhaused, pending on q.event")
+			c.sendMsg--
+			q.Wait()
+			log.V(6).Infof("queue event received")
+			continue
+			//return fmt.Errorf("end of updates")
 		}
 		var resp *gpb.SubscribeResponse
 		switch v := event.(type) {
@@ -203,12 +407,14 @@ func (c *Client) processQueue(stream gpb.GNMI_SubscribeServer) error {
 		case *gpb.SubscribeResponse:
 			resp = v
 		}
-		log.V(1).Infof("Client %s sending:\n%v", c, resp)
+
 		err = stream.Send(resp)
 		if err != nil {
+			log.V(1).Infof("Client %s sending error:%v", c, resp)
 			c.errors++
 			return err
 		}
+		log.V(1).Infof("Client %s done sending: %v", c, resp)
 	}
 }
 
@@ -238,17 +444,21 @@ func (c *Client) reset() error {
 	log.V(1).Infof("Client %s using config:\n%s", c, pretty.Sprint(c.config))
 	switch {
 	default:
+		log.V(1).Infof("Client %s --- c.config.Values: \n%s", c, pretty.Sprint(c.config.Values))
 		q := queue.New(c.config.GetEnableDelay(), c.config.Seed, c.config.Values)
-		// Inject sync message after latest provided update in the config.
-		if !c.config.DisableSync {
-			q.Add(&fpb.Value{
-				Timestamp: &fpb.Timestamp{Timestamp: q.Latest()},
-				Repeat:    1,
-				Value:     &fpb.Value_Sync{uint64(1)},
-			})
-		}
+		/*
+			// Inject sync message after latest provided update in the config.
+			if !c.config.DisableSync {
+				q.Add(&fpb.Value{
+					Timestamp: &fpb.Timestamp{Timestamp: q.Latest()},
+					Repeat:    1,
+					Value:     &fpb.Value_Sync{uint64(1)},
+				})
+			}
+		*/
 		c.q = q
 	case c.config.GetFixed() != nil:
+		log.V(1).Infof("Client %s  queue.NewFixed", c)
 		q := queue.NewFixed(c.config.GetFixed().Responses, c.config.EnableDelay)
 		// Inject sync message after latest provided update in the config.
 		if !c.config.DisableSync {
