@@ -35,7 +35,7 @@ import (
 // FixedQeueue or UpdateQueue.
 type Queue interface {
 	Next() (interface{}, error)
-	Wait()
+	Wait() bool
 	Signal()
 	Add(interface{})
 }
@@ -50,7 +50,7 @@ type UpdateQueue struct {
 	latest   int64
 	q        [][]*value
 	r        *rand.Rand
-	event    chan string
+	event    chan struct{}
 }
 
 // New creates a new UpdateQueue. If delay is true, a call to Next()
@@ -66,7 +66,7 @@ func New(delay bool, seed int64, values []*fpb.Value) *UpdateQueue {
 		u.addValue(newValue(v, u.r))
 	}
 
-	u.event = make(chan string, 1)
+	u.event = make(chan struct{}, 2)
 	/*
 		ticker := time.NewTicker(time.Millisecond * 2000)
 		go func() {
@@ -90,10 +90,8 @@ func New(delay bool, seed int64, values []*fpb.Value) *UpdateQueue {
 
 // Add inserts v into the queue in correct timestamp order.
 func (u *UpdateQueue) Add(val interface{}) {
-	log.V(6).Infof("Add enter: queue len is %v", len(u.q))
 	u.mu.Lock()
 	defer u.mu.Unlock()
-
 	// Type assertion, panic if not match
 	v := val.(*fpb.Value)
 	u.addValue(newValue(v, u.r))
@@ -110,14 +108,15 @@ func (u *UpdateQueue) Latest() int64 {
 }
 
 // Hold until being notified.
-func (u *UpdateQueue) Wait() {
-	msg := <-u.event
+func (u *UpdateQueue) Wait() bool {
+	msg, more := <-u.event
 	log.V(6).Infof("Received %v", msg)
+	return more
 }
 
 func (u *UpdateQueue) Signal() {
 	// Notify consumer if updateQueue was empty
-	u.event <- "ping"
+	u.event <- struct{}{}
 	log.V(6).Infof("Done Sending ping to channel u.event")
 }
 
@@ -161,6 +160,7 @@ func (u *UpdateQueue) Next() (interface{}, error) {
 	if u.delay && checkDelay && len(u.q) > 0 {
 		u.duration = time.Duration(u.q[0][0].v.Timestamp.Timestamp-val.Timestamp.Timestamp) * time.Nanosecond
 	}
+	log.V(5).Infof("Queue Next() remaining len(u.q) %v", len(u.q))
 	return val, nil
 }
 

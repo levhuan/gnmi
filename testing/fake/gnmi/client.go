@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,7 +55,7 @@ type Client struct {
 func NewClient(config *fpb.Config) *Client {
 	return &Client{
 		config: config,
-		polled: make(chan struct{}),
+		polled: make(chan struct{}, 2),
 		synced: false,
 	}
 }
@@ -64,20 +65,13 @@ func (c *Client) String() string {
 	return c.config.Target
 }
 
-// Support fixed CONFIG_DB for now
-func subscribeDb(c *Client, stop chan struct{}) {
-	sublist := c.subscribe
+func getDbpath(c *Client) ([]string, error) {
+
 	var buffer bytes.Buffer
-	// _ = sublist
-
-	log.V(6).Infof("SubscribRequest : %#v", sublist)
-
-	var dbn int
 	var dbpath []string
-	var sstables []*swsscommon.SubscriberStateTable
-	// TODO: get db number from prefix or path
-	dbn = swsscommon.CONFIG_DB
 
+	sublist := c.subscribe
+	log.V(6).Infof("SubscribRequest : %#v", sublist)
 	// TODO: Prefix parsing parsing
 	prefix := sublist.GetPrefix()
 	log.V(6).Infof("prefix : %#v", prefix)
@@ -108,7 +102,21 @@ func subscribeDb(c *Client, stop chan struct{}) {
 		}
 	}
 	log.V(6).Infof("dbpath : %#v", dbpath)
+	return dbpath, nil
+}
 
+// Support fixed CONFIG_DB for now
+func subscribeDb(c *Client, stop chan struct{}) {
+	var buffer bytes.Buffer
+	var dbn int
+	var sstables []*swsscommon.SubscriberStateTable
+	// TODO: get db number from prefix or path
+	dbn = swsscommon.CONFIG_DB
+
+	dbpath, err := getDbpath(c)
+	if err != nil {
+		log.V(1).Infof("Failed to get dbpath for %v", c)
+	}
 	db := swsscommon.NewDBConnector(dbn, swsscommon.DBConnectorDEFAULT_UNIXSOCKET, uint(0))
 	defer swsscommon.DeleteDBConnector(db)
 
@@ -215,6 +223,7 @@ func subscribeDb(c *Client, stop chan struct{}) {
 				}
 
 				fpbv := &fpb.Value{
+					// Should use path elements in original subscription list
 					Path:      path,
 					Timestamp: &fpb.Timestamp{Timestamp: time.Now().UnixNano()},
 					Repeat:    1,
@@ -232,6 +241,109 @@ func subscribeDb(c *Client, stop chan struct{}) {
 				log.V(5).Infof("Added fpbv #%v", fpbv)
 			}
 		}
+	}
+}
+
+// Support fixed COUNTERS_DB for now
+func pollDb(c *Client, stop chan struct{}) {
+	var buffer bytes.Buffer
+	var dbn int
+	var dbpath []string
+
+	// TODO: get db number from prefix or path
+	dbn = swsscommon.COUNTERS_DB
+
+	dbpath, err := getDbpath(c)
+	if err != nil {
+		log.V(1).Infof("Failed to get dbpath for %v", c)
+	}
+
+	db := swsscommon.NewDBConnector(dbn, swsscommon.DBConnectorDEFAULT_UNIXSOCKET, uint(0))
+	defer swsscommon.DeleteDBConnector(db)
+
+	// Use first path, testing only!
+	tbl := swsscommon.NewTable(db, dbpath[0])
+	defer swsscommon.DeleteTable(tbl)
+
+	// get all keys in DB first
+	keys := swsscommon.NewVectorString()
+	//defer swsscommon.DeleteVectorString(keys)
+	tbl.GetKeys(keys)
+
+	dbkeys := []string{""}
+	//var dbkeys []string
+	for i := 0; i < int(keys.Size()); i++ {
+		dbkeys = append(dbkeys, keys.Get(i))
+	}
+	swsscommon.DeleteVectorString(keys)
+
+	//TODO: get all keys in DB, then find all matches for each dbpath.
+	/*
+		// get all keys in DB first
+		keys := swsscommon.NewVectorString()
+		defer swsscommon.DeleteVectorString(keys)
+		tbl.GetKeys(keys)
+		for i :=0; i < keys.Size(); i++ {
+
+		}
+		for _, table := range dbpath {
+			//populate data for each path with the key info
+		}
+	*/
+	q := c.q
+	for {
+		_, more := <-c.polled
+		if !more {
+			log.V(1).Infof("%v polled channel closed, exiting pollDb routine", c)
+			return
+		}
+		log.V(2).Infof("dbkeys len: %v", len(dbkeys))
+		for idx, dbkey := range dbkeys {
+			vpsr := swsscommon.NewFieldValuePairs()
+			defer swsscommon.DeleteFieldValuePairs(vpsr)
+
+			ret := tbl.Get(dbkey, vpsr)
+			if ret != true {
+				// TODO: Key might gets deleted
+				log.V(1).Infof("%v table get failed", dbkey)
+				continue
+			}
+
+			path := []string{tbl.GetTableName()}
+			if strings.Compare(dbkey, "") != 0 {
+				path = append(path, dbkey)
+			}
+
+			buffer.Reset()
+			for n := vpsr.Size() - 1; n >= 0; n-- {
+				buffer.WriteString("  ")
+				fieldpair := vpsr.Get(int(n))
+				buffer.WriteString(fieldpair.GetFirst())
+				buffer.WriteString("=")
+				buffer.WriteString(fieldpair.GetSecond())
+			}
+			fpbv := &fpb.Value{
+				//Path:      dbpath,
+				Path:      path,
+				Timestamp: &fpb.Timestamp{Timestamp: time.Now().UnixNano()},
+				Repeat:    1,
+				Seed:      0,
+				Value: &fpb.Value_StringValue{&fpb.StringValue{
+					Value: buffer.String()}},
+			}
+			q.Add(fpbv)
+			log.V(5).Infof("Added idex %v fpbv #%v ", idx, fpbv)
+		}
+
+		if !c.config.DisableSync {
+			q.Add(&fpb.Value{
+				Timestamp: &fpb.Timestamp{Timestamp: time.Now().UnixNano()},
+				Repeat:    1,
+				Value:     &fpb.Value_Sync{uint64(1)},
+			})
+			log.V(2).Infof("Sync done!")
+		}
+
 	}
 }
 
@@ -278,12 +390,16 @@ func (c *Client) Run(stream gpb.GNMI_SubscribeServer) (err error) {
 		return grpc.Errorf(codes.Aborted, "failed to initialize the queue: %v", err)
 	}
 
-	if c.subscribe.GetMode() == gpb.SubscriptionList_STREAM {
-		stoppedchan := make(chan struct{})
-		defer close(stoppedchan)
-		go subscribeDb(c, stoppedchan)
-	}
+	stop := make(chan struct{})
+	defer close(stop)
 
+	if c.subscribe.GetMode() == gpb.SubscriptionList_STREAM {
+		go subscribeDb(c, stop)
+	}
+	if c.subscribe.GetMode() == gpb.SubscriptionList_POLL {
+		c.polled <- struct{}{}
+		go pollDb(c, stop)
+	}
 	/*
 		if sublist.Mode == gpb.SubscriptionList_ONCE {
 			log.V(1).Infof("gpb.SubscriptionList_ONCE mode not supported : %#v", sublist)
@@ -346,10 +462,12 @@ func (c *Client) recv(stream gpb.GNMI_SubscribeServer) {
 				c.Close()
 				return
 			}
-			if err = c.reset(); err != nil {
-				c.Close()
-				return
-			}
+			/*
+				if err = c.reset(); err != nil {
+					c.Close()
+					return
+				}
+			*/
 			c.polled <- struct{}{}
 			continue
 		}
@@ -383,18 +501,19 @@ func (c *Client) processQueue(stream gpb.GNMI_SubscribeServer) error {
 		}
 		if event == nil {
 			switch {
-			case c.subscribe.Mode == gpb.SubscriptionList_POLL:
-				<-c.polled
-				log.V(1).Infof("Client %s received poll", c)
-				return nil
 			case c.config.DisableEof:
 				return fmt.Errorf("send exiting due to disabled EOF")
 			}
 			log.V(6).Infof("queue exhaused, pending on q.event")
 			c.sendMsg--
-			q.Wait()
-			log.V(6).Infof("queue event received")
-			continue
+
+			more := q.Wait()
+			if more {
+				log.V(6).Infof("queue event received")
+				continue
+			} else {
+				return fmt.Errorf("Queue closed, end of updates")
+			}
 			//return fmt.Errorf("end of updates")
 		}
 		var resp *gpb.SubscribeResponse
@@ -414,7 +533,8 @@ func (c *Client) processQueue(stream gpb.GNMI_SubscribeServer) error {
 			c.errors++
 			return err
 		}
-		log.V(1).Infof("Client %s done sending: %v", c, resp)
+		log.V(5).Infof("Client %s done sending: %v", c, resp)
+		log.V(2).Infof("Client %s done sending, msg count %d", c, c.sendMsg)
 	}
 }
 

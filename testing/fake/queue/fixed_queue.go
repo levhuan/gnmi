@@ -43,7 +43,8 @@ func (q *FixedQueue) Add(r interface{}) {
 }
 
 // Hold until being notified.
-func (u *FixedQueue) Wait() {
+func (u *FixedQueue) Wait() bool {
+	return true
 }
 
 func (u *FixedQueue) Signal() {
