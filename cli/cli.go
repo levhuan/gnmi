@@ -109,7 +109,7 @@ func sendQueryAndDisplay(ctx context.Context, query client.Query, cfg *Config) e
 		defer cancel()
 	}
 
-	fmt.Printf("sendQueryAndDisplay: %v %d query.Queries: %v\n", displayTypeMap[cfg.DisplayType], query.Type, query.Queries)
+	fmt.Printf("sendQueryAndDisplay: %v %v query.Queries: %v\n", displayTypeMap[cfg.DisplayType], typeString[query.Type], query.Queries)
 	switch displayTypeMap[cfg.DisplayType] {
 	default:
 		return fmt.Errorf("unknown display type %q", cfg.DisplayType)
@@ -293,7 +293,7 @@ func displayStreamingResults(ctx context.Context, query client.Query, cfg *Confi
 	complete := false
 	display := func(path []string, ts time.Time, val interface{}) {
 		if !complete {
-			return
+			//	return
 		}
 		b := make(pathmap)
 		if cfg.Timestamp != "" {

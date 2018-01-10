@@ -19,6 +19,7 @@ limitations under the License.
 package value
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"unicode/utf8"
@@ -117,6 +118,10 @@ func ToScalar(tv *pb.TypedValue) (interface{}, error) {
 		i = ss
 	case *pb.TypedValue_BytesVal:
 		i = tv.GetBytesVal()
+	case *pb.TypedValue_JsonIetfVal:
+		var val interface{}
+		val = tv.GetJsonIetfVal()
+		json.Unmarshal(val.([]byte), &i)
 	default:
 		return nil, fmt.Errorf("non-scalar type %+v", tv.Value)
 	}
